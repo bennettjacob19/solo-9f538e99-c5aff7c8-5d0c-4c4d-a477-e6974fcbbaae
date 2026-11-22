@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
 from . import routing
-from .models import PrecheckRequest, PrecheckResponse
+from .models import AuditRequest, AuditResponse, PrecheckRequest, PrecheckResponse
 
 app = FastAPI(
     title="Dual-Egress Routing Precheck",
@@ -52,6 +52,28 @@ def precheck(req: PrecheckRequest) -> dict:
             req.before.routes,
             req.after.rules,
             req.after.routes,
+        )
+    except routing.UnsupportedInput as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/audit-unused",
+    response_model=AuditResponse,
+    tags=["audit"],
+    responses={
+        200: {"description": "Per-entry safe-to-remove verdict with verifiable evidence"},
+        400: {"description": "Unsupported or invalid input"},
+        422: {"description": "Request body does not match the schema"},
+    },
+)
+def audit_unused(req: AuditRequest) -> dict:
+    try:
+        return routing.run_audit(
+            req.source_cidr,
+            req.destination_cidr,
+            req.rules,
+            req.routes,
         )
     except routing.UnsupportedInput as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

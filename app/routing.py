@@ -95,6 +95,7 @@ class Rule:
     dst: ipaddress.IPv4Network
     table: TableKey
     table_display: str
+    orig_index: int  # position in the raw `ip -j -4 rule show` array
 
 
 def parse_rules(raw: Any, label: str) -> list[Rule]:
@@ -137,7 +138,7 @@ def parse_rules(raw: Any, label: str) -> list[Rule]:
             continue  # rules pointing to the local table are skipped
         src = parse_prefix(entry.get("src", "all"), f"{what} 'src'")
         dst = parse_prefix(entry.get("dst", "all"), f"{what} 'dst'")
-        rules.append(Rule(priority, src, dst, table, str(entry["table"])))
+        rules.append(Rule(priority, src, dst, table, str(entry["table"]), idx))
     seen: set[int] = set()
     for rule in rules:
         if rule.priority in seen:
@@ -170,6 +171,8 @@ class Route:
     rtype: str  # "unicast" | "throw" | "blackhole"
     dev: Optional[str]
     gateway: Optional[str]
+    orig_index: int  # position in the raw `ip -j -4 route show table all` array
+    table_display: str
 
 
 def parse_routes(raw: Any, label: str) -> dict[TableKey, list[Route]]:
@@ -225,7 +228,9 @@ def parse_routes(raw: Any, label: str) -> dict[TableKey, list[Route]]:
         else:
             dev = None
             gateway = None
-        tables.setdefault(table, []).append(Route(prefix, rtype, dev, gateway))
+        tables.setdefault(table, []).append(
+            Route(prefix, rtype, dev, gateway, idx, str(entry.get("table", "main")))
+        )
     return tables
 
 
@@ -458,4 +463,368 @@ def run_precheck(
             }
             for key, group in ordered
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# dead-config audit: which single rule / route can be removed safely
+# ---------------------------------------------------------------------------
+
+# audit verdict reason codes
+REASON_CLEANABLE = "cleanable"
+REASON_NOT_REFERENCED = "not_referenced_in_scope"
+REASON_FORWARDING_CHANGES = "forwarding_changes"
+REASON_LOCAL_EXCLUDED = "local_table_excluded"
+
+
+def _partition_cells(
+    src_net: ipaddress.IPv4Network,
+    dst_net: ipaddress.IPv4Network,
+    rules: list[Rule],
+    tables: dict[TableKey, list[Route]],
+) -> list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const]]:
+    """Partition src_net x dst_net into rectangles with one constant decision.
+
+    Every decision boundary (rule selectors, route prefixes) is aligned on CIDR
+    boundaries, so the rectangles tile the whole queried address space without
+    overlaps.  Re-running the lookup with one rule/route removed keeps each
+    rectangle constant too: removal only deletes boundaries, it never adds one.
+    """
+    cells: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const]] = []
+
+    def rec(s: ipaddress.IPv4Network, d: ipaddress.IPv4Network) -> None:
+        if len(cells) >= MAX_CELLS:
+            raise UnsupportedInput(
+                f"address space is fragmented into more than {MAX_CELLS} decision "
+                "cells; narrow the CIDRs or simplify the policy"
+            )
+        decision = _decide_rect(s, d, rules, tables)
+        if isinstance(decision, _Const):
+            cells.append((s, d, decision))
+            return
+        if decision.dim == "src":
+            left, right = s.subnets()
+            rec(left, d)
+            rec(right, d)
+        else:
+            left, right = d.subnets()
+            rec(s, left)
+            rec(s, right)
+
+    rec(src_net, dst_net)
+    return cells
+
+
+@dataclass
+class _Usage:
+    """Which rules/routes actually decide traffic, and on how many pairs."""
+
+    rule_pairs: dict[int, int]
+    route_pairs: dict[int, int]
+    rule_sample: dict[int, tuple[ipaddress.IPv4Network, ipaddress.IPv4Network]]
+    route_sample: dict[int, tuple[ipaddress.IPv4Network, ipaddress.IPv4Network]]
+
+
+def _trace_usage(
+    cells: list[tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const]],
+    rules: list[Rule],
+    tables: dict[TableKey, list[Route]],
+) -> _Usage:
+    """Walk every decision cell with the real rule order and record usage.
+
+    A rule is "used" when its selectors match at least one queried pair;
+    a route is "used" when it is consulted as the longest-prefix route of a
+    matched rule's table (including a longest-prefix ``throw`` that makes the
+    lookup fall through).  Items never hit inside the queried range stay
+    unrecorded and cannot be declared safe later.
+    """
+    rule_pairs: dict[int, int] = {}
+    route_pairs: dict[int, int] = {}
+    rule_sample: dict[int, tuple] = {}
+    route_sample: dict[int, tuple] = {}
+
+    for s, d, _const in cells:
+        area = _addr_count(s) * _addr_count(d)
+        routes_hit_in_cell: set[int] = set()
+        for rule in rules:
+            if not s.subnet_of(rule.src) or not d.subnet_of(rule.dst):
+                continue
+            rule_pairs[rule.orig_index] = rule_pairs.get(rule.orig_index, 0) + area
+            rule_sample.setdefault(rule.orig_index, (s, d))
+            best: Optional[Route] = None
+            for route in tables.get(rule.table, ()):
+                if d.subnet_of(route.prefix) and (
+                    best is None or route.prefix.prefixlen > best.prefix.prefixlen
+                ):
+                    best = route
+            if best is not None:
+                # several rules may point at the same table; count each route
+                # only once per address pair
+                if best.orig_index not in routes_hit_in_cell:
+                    routes_hit_in_cell.add(best.orig_index)
+                    route_pairs[best.orig_index] = (
+                        route_pairs.get(best.orig_index, 0) + area
+                    )
+                    route_sample.setdefault(best.orig_index, (s, d))
+                if best.rtype in ("unicast", "blackhole"):
+                    break  # terminal decision; later rules are not consulted here
+            # no route or a throw: fall through to the next rule
+    return _Usage(rule_pairs, route_pairs, rule_sample, route_sample)
+
+
+def _points_to_local(entry: dict) -> bool:
+    try:
+        return normalize_table(entry.get("table"), "audit") == LOCAL_TABLE_ID
+    except UnsupportedInput:
+        return False
+
+
+def _rule_identity(entry: dict) -> dict:
+    identity: dict[str, Any] = {"priority": entry.get("priority")}
+    if "src" in entry:
+        identity["src"] = entry["src"]
+    if "dst" in entry:
+        identity["dst"] = entry["dst"]
+    identity["table"] = entry.get("table")
+    if "action" in entry:
+        identity["action"] = entry["action"]
+    return identity
+
+
+def _route_identity(entry: dict) -> dict:
+    identity: dict[str, Any] = {"dst": entry.get("dst"), "table": entry.get("table", "main")}
+    if "type" in entry:
+        identity["type"] = entry["type"]
+    if "dev" in entry:
+        identity["dev"] = entry["dev"]
+    if "gateway" in entry:
+        identity["gateway"] = entry["gateway"]
+    return identity
+
+
+def _evaluate_removal(
+    cells: list[
+        tuple[ipaddress.IPv4Network, ipaddress.IPv4Network, _Const]
+    ],
+    rules: list[Rule],
+    tables: dict[TableKey, list[Route]],
+) -> tuple[int, Optional[dict]]:
+    """Re-run the lookup over every baseline cell for one modified snapshot.
+
+    Returns (number of pairs whose result changed, evidence for the first
+    changed cell).  Baseline cells hold no internal decision boundary, so the
+    modified lookup is constant on each of them.
+    """
+    changed = 0
+    first: Optional[dict] = None
+    for s, d, const in cells:
+        decision = _decide_rect(s, d, rules, tables)
+        if not isinstance(decision, _Const):  # pragma: no cover - removal adds no boundary
+            raise AssertionError("removing an item must not split a baseline decision cell")
+        if decision.result != const.result:
+            area = _addr_count(s) * _addr_count(d)
+            changed += area
+            if first is None:
+                first = {
+                    "sample": {"source": str(s.network_address),
+                               "destination": str(d.network_address)},
+                    "before_removal": result_json(const.result),
+                    "after_removal": result_json(decision.result),
+                    "basis_before_removal": const.basis,
+                    "basis_after_removal": decision.basis,
+                    "changed_pairs_in_sample_cell": str(area),
+                }
+    return changed, first
+
+
+def run_audit(
+    source_cidr: Any,
+    destination_cidr: Any,
+    raw_rules: Any,
+    raw_routes: Any,
+) -> dict:
+    """Audit every rule/route of one snapshot for safe removal.
+
+    An item is reported cleanable only when (1) it is actually consulted for
+    at least one queried address pair and (2) deleting it leaves the whole
+    source x destination range with identical results -- identical
+    (dev, gateway) unicast combinations, blackholes and no-route outcomes.
+    Items that simply never match inside the range are kept distinct so a
+    narrower query can never turn shadowed config into a "safe" verdict.
+    """
+    src_net = parse_prefix(source_cidr, "source_cidr")
+    dst_net = parse_prefix(destination_cidr, "destination_cidr")
+    if not isinstance(raw_rules, list):
+        raise UnsupportedInput(
+            "rules: must be the JSON array from `ip -j -4 rule show`"
+        )
+    if not isinstance(raw_routes, list):
+        raise UnsupportedInput(
+            "routes: must be the JSON array from `ip -j -4 route show table all`"
+        )
+
+    rules = parse_rules(raw_rules, "snapshot")
+    tables = parse_routes(raw_routes, "snapshot")
+
+    cells = _partition_cells(src_net, dst_net, rules, tables)
+    total_pairs = _addr_count(src_net) * _addr_count(dst_net)
+    usage = _trace_usage(cells, rules, tables)
+
+    parsed_rules_by_index = {rule.orig_index: rule for rule in rules}
+    parsed_routes_by_index = {
+        route.orig_index: table_routes
+        for table_routes in tables.values()
+        for route in table_routes
+    }
+
+    audited_rules: list[dict] = []
+    cleanable_rules = 0
+    for idx, entry in enumerate(raw_rules):
+        identity = _rule_identity(entry)
+        if _points_to_local(entry):
+            audited_rules.append({
+                "index": idx,
+                "kind": "rule",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_LOCAL_EXCLUDED,
+                "evidence": {
+                    "detail": "rules pointing to the local table are not modeled; "
+                              "their effect is outside this audit's scope"
+                },
+            })
+            continue
+        rule = parsed_rules_by_index.get(idx)
+        if rule is None or idx not in usage.rule_pairs:
+            audited_rules.append({
+                "index": idx,
+                "kind": "rule",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_NOT_REFERENCED,
+                "evidence": {
+                    "detail": "no (source, destination) pair in the queried CIDR range "
+                              "matches this rule's selectors; it cannot be proven safe "
+                              "from this query alone"
+                },
+            })
+            continue
+        modified_rules = [r for r in rules if r.orig_index != idx]
+        changed, first_change = _evaluate_removal(cells, modified_rules, tables)
+        sample_s, sample_d = usage.rule_sample[idx]
+        evidence: dict[str, Any] = {
+            "matched_pairs": str(usage.rule_pairs[idx]),
+            "sample": {"source": str(sample_s.network_address),
+                       "destination": str(sample_d.network_address)},
+        }
+        if changed == 0:
+            cleanable_rules += 1
+            sample_cell = next(
+                c for c in cells if c[0] == sample_s and c[1] == sample_d
+            )[2]
+            evidence["changed_pairs_after_removal"] = "0"
+            evidence["sample_result_before_removal"] = result_json(sample_cell.result)
+            evidence["sample_basis_before_removal"] = sample_cell.basis
+            audited_rules.append({
+                "index": idx,
+                "kind": "rule",
+                "identity": identity,
+                "cleanable": True,
+                "reason": REASON_CLEANABLE,
+                "evidence": evidence,
+            })
+        else:
+            evidence["changed_pairs_after_removal"] = str(changed)
+            evidence["first_change"] = first_change
+            audited_rules.append({
+                "index": idx,
+                "kind": "rule",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_FORWARDING_CHANGES,
+                "evidence": evidence,
+            })
+
+    audited_routes: list[dict] = []
+    cleanable_routes = 0
+    for idx, entry in enumerate(raw_routes):
+        identity = _route_identity(entry)
+        if normalize_table(entry.get("table", "main"), "audit") == LOCAL_TABLE_ID:
+            audited_routes.append({
+                "index": idx,
+                "kind": "route",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_LOCAL_EXCLUDED,
+                "evidence": {
+                    "detail": "routes in the local table are not modeled; their "
+                              "effect is outside this audit's scope"
+                },
+            })
+            continue
+        if idx not in parsed_routes_by_index or idx not in usage.route_pairs:
+            audited_routes.append({
+                "index": idx,
+                "kind": "route",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_NOT_REFERENCED,
+                "evidence": {
+                    "detail": "no (source, destination) pair in the queried CIDR range "
+                              "consults this route as a table's longest-prefix match; "
+                              "it cannot be proven safe from this query alone"
+                },
+            })
+            continue
+        modified_tables = {
+            table: [r for r in table_routes if r.orig_index != idx]
+            for table, table_routes in tables.items()
+        }
+        changed, first_change = _evaluate_removal(cells, rules, modified_tables)
+        sample_s, sample_d = usage.route_sample[idx]
+        evidence = {
+            "matched_pairs": str(usage.route_pairs[idx]),
+            "sample": {"source": str(sample_s.network_address),
+                       "destination": str(sample_d.network_address)},
+        }
+        if changed == 0:
+            cleanable_routes += 1
+            sample_cell = next(
+                c for c in cells if c[0] == sample_s and c[1] == sample_d
+            )[2]
+            evidence["changed_pairs_after_removal"] = "0"
+            evidence["sample_result_before_removal"] = result_json(sample_cell.result)
+            evidence["sample_basis_before_removal"] = sample_cell.basis
+            audited_routes.append({
+                "index": idx,
+                "kind": "route",
+                "identity": identity,
+                "cleanable": True,
+                "reason": REASON_CLEANABLE,
+                "evidence": evidence,
+            })
+        else:
+            evidence["changed_pairs_after_removal"] = str(changed)
+            evidence["first_change"] = first_change
+            audited_routes.append({
+                "index": idx,
+                "kind": "route",
+                "identity": identity,
+                "cleanable": False,
+                "reason": REASON_FORWARDING_CHANGES,
+                "evidence": evidence,
+            })
+
+    return {
+        "summary": {
+            "source_cidr": str(src_net),
+            "destination_cidr": str(dst_net),
+            "total_pairs": str(total_pairs),
+            "rules_total": len(raw_rules),
+            "rules_cleanable": cleanable_rules,
+            "routes_total": len(raw_routes),
+            "routes_cleanable": cleanable_routes,
+        },
+        "rules": audited_rules,
+        "routes": audited_routes,
     }
