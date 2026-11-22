@@ -1,0 +1,7 @@
+services:
+  precheck:
+    build: .
+    image: route-precheck:latest
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
